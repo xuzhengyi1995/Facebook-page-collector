@@ -3,12 +3,15 @@
 import gzip
 import json
 import os
+import pickle
 import random
 import re
+import signal
 import time
 from html.parser import HTMLParser
 from urllib.parse import quote, unquote
 
+import settings
 from get_html import GetHtml
 
 random.seed()
@@ -17,18 +20,29 @@ if(os.path.isdir(execution_time) != True):
     os.makedirs(execution_time)
 os.makedirs(execution_time + '/errors')
 
+# Load history
+if os.path.isfile('./saves.pickle'):
+    with open('./saves.pickle', 'rb') as save_file:
+        POST_GOT = pickle.load(save_file)
+else:
+    POST_GOT = {}
+
 # List of id to collect
-PAGE_IDS = [
-    'PAGE_ID_YOU_WANT_TO_GET_1',
-    'PAGE_ID_YOU_WANT_TO_GET_2',
-]
-COOKIES = 'YOUR_FACEBOOK_COOKIES'
-NUM_TO_FETCH = 200
-MAX_RETRY = 2000000
+PAGE_IDS = settings.PAGE_IDS
+COOKIES = settings.COOKIES
+NUM_TO_FETCH = settings.NUM_TO_FETCH
+MAX_RETRY = settings.MAX_RETRY
 # Retry sleep in second
-RETRY_SLEEP = 600
+RETRY_SLEEP = settings.RETRY_SLEEP
 # Prevent block sleep time
-PREVENT_BLOCK_SLEEP_TIME = 120
+PREVENT_BLOCK_SLEEP_TIME = settings.PREVENT_BLOCK_SLEEP_TIME
+GET_ALL_COMMENTS = settings.SWITCHS['get_all_comments']
+GET_ALL_REACTIONS = settings.SWITCHS['get_all_reactions']
+USE_REMEMBER = settings.SWITCHS['remember_got_posts']
+POSTS_TO_GET_EACH_PAGE = settings.POSTS_TO_GET_EACH_PAGE
+if POSTS_TO_GET_EACH_PAGE != 0 and POSTS_TO_GET_EACH_PAGE < NUM_TO_FETCH:
+    NUM_TO_FETCH = POSTS_TO_GET_EACH_PAGE
+SUM_POSTS = 0
 
 HEADERS = {
     'accept': '*/*',
@@ -70,6 +84,18 @@ GET_TEXT_RE = re.compile(r'<[^>]*>')
 DELETE_SPACE_RE = re.compile(r' {2,}')
 
 
+def exit_with_save(signum, frame):
+    signal.signal(signal.SIGINT, original_sigint)
+    save_history()
+    exit()
+    signal.signal(signal.SIGINT, exit_with_save)
+
+
+def save_history():
+    with open('./saves.pickle', 'wb') as file_to_save:
+        pickle.dump(POST_GOT, file_to_save)
+
+
 def random_access_pages():
     get_html = GetHtml()
     choosed_url = PREVENT_BLOCK_URLS[int(random.random() * LEN_PB_URLS)]
@@ -86,10 +112,11 @@ def find_nex_start_cursor(json_require):
 
 
 def download_pages():
+    global SUM_POSTS
     get_html = GetHtml()
-    story_fbid = {}
     find_id_re = re.compile(r"story_fbid=([0-9]+)&amp;id=([0-9]+)")
     for page_id in PAGE_IDS:
+        SUM_POSTS = 0
         store_folder = execution_time + '/' + page_id
         os.mkdir(store_folder)
         start_cursor = START_CURSOR_BASE
@@ -97,6 +124,7 @@ def download_pages():
         nb_time = 0
         print('Getting page id: %s' % page_id)
         while has_next_page:
+            story_fbid = {}
             nb_time += 1
             print('    Now count: %d' % nb_time)
             this_url = BASE_URL % (page_id, quote(
@@ -146,9 +174,12 @@ def download_pages():
             print(
                 '        This time got %d post ids, start getting detail content...' % got_count)
             download_details(story_fbid, store_folder)
+            if POSTS_TO_GET_EACH_PAGE != 0 and SUM_POSTS >= POSTS_TO_GET_EACH_PAGE:
+                has_next_page = False
 
 
 def download_details(ids, store_folder):
+    global SUM_POSTS
     get_html = GetHtml()
     '''
     Comment:
@@ -184,6 +215,10 @@ def download_details(ids, store_folder):
         r'<div class="_5rgt _5nk5"[^>]*>(.*?)</?div')
     get_post_time_re = re.compile(r'<abbr>(.*?)</abbr>')
     for (id1, id2) in ids.items():
+        # if we already have this post id or not
+        if USE_REMEMBER and POST_GOT.get(id1):
+            print('         We have got post id %s, skiped.' % id1)
+            continue
         print('         Getting detail info for post id %s' % id1)
         # This page can also be blocked
         post_retry_count = 0
@@ -251,7 +286,7 @@ def download_details(ids, store_folder):
 
                     fb_story["comment"]["count"] = comment_sum
                     more_info = get_more_comment_url.findall(comment_data)
-                    if len(more_info) != 0:
+                    if len(more_info) != 0 and GET_ALL_COMMENTS:
                         this_url = "https://m.facebook.com" + \
                             HTML_PARSER.unescape(more_info[0])
                         get_html.set(url=this_url, header=HEADERS)
@@ -310,6 +345,11 @@ def download_details(ids, store_folder):
 
         with open(store_folder + "/fbid_%s.json" % id1, "w", encoding="utf-8") as f:
             f.write(json.dumps(fb_story))
+            POST_GOT[id1] = True
+            SUM_POSTS += 1
+            if POSTS_TO_GET_EACH_PAGE != 0 and SUM_POSTS >= POSTS_TO_GET_EACH_PAGE:
+                print('[INFO] got %d posts, go to next.' % SUM_POSTS)
+                return
 
 
 def download_reaction(url, fb_id):
@@ -390,7 +430,7 @@ def download_reaction(url, fb_id):
             })
 
         more_info = load_more_user_url_re.findall(data)
-        if len(more_info) != 0:
+        if len(more_info) != 0 and GET_ALL_REACTIONS:
             this_url = "https://m.facebook.com" + \
                 HTML_PARSER.unescape(more_info[0])
             get_html.set(url=this_url, header=HEADERS)
@@ -435,4 +475,12 @@ def download_reaction(url, fb_id):
 
 
 if __name__ == '__main__':
+    original_sigint = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, exit_with_save)
     download_pages()
+    save_history()
+    # ids = {
+    #     '1673381129459180': '222778774519430',
+    #     '2344197969167803': '222778774519430'
+    # }
+    # download_details(ids, '.')
